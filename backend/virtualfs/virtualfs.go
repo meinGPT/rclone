@@ -1,7 +1,14 @@
-// Package virtualfs provides an interface to a virtual filesystem
-// where file metadata persists, and content is stored temporarily.
-// Only files that have changed on the remote are synced.
-// Files that have been processed locally are not re-synced.
+// Package virtualfs provides a custom backend for rclone, designed to optimize file synchronization
+// from remote sources by persisting file metadata and temporarily storing file content. This approach
+// ensures that files are ingested from the remote only once, and files that have been processed locally
+// are not re-synced, saving bandwidth and storage space.
+//
+// Key Features:
+// - **Persist file metadata**: Even after files are deleted locally, their metadata remains, making it appear as if the files are still present to rclone.
+// - **Temporary content storage**: File content is stored locally only as long as needed, freeing up space after processing.
+// - **Optimize synchronization**: Only sync files that have changed on the remote. Processed files are not re-synced.
+// - **SQLite database**: Stores metadata efficiently and allows for complex queries if needed.
+
 package virtualfs
 
 import (
@@ -10,7 +17,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -48,7 +55,7 @@ type Fs struct {
 	opt      Options      // options
 	features *fs.Features // optional features
 	db       *sql.DB      // SQLite database connection
-	dbLock   sync.Mutex   // lock for database operations
+	dbLock   sync.RWMutex // read-write lock for database operations
 }
 
 // Object represents a file object in the virtual filesystem
@@ -90,7 +97,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}).Fill(ctx, f)
 
 	// Initialize SQLite database
-	dbPath := filepath.Join(opt.RootDirectory, "virtualfs.db")
+	dbPath := path.Join(opt.RootDirectory, "virtualfs.db")
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -122,6 +129,8 @@ func (f *Fs) createTables() error {
 			deleted BOOLEAN,
 			is_dir BOOLEAN
 		);
+		CREATE INDEX IF NOT EXISTS idx_files_remote ON files(remote);
+		CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(deleted);
 	`)
 	return err
 }
@@ -131,19 +140,30 @@ func (f *Fs) ensureDirectoryStructure(remote string) error {
 	f.dbLock.Lock()
 	defer f.dbLock.Unlock()
 
-	parts := strings.Split(filepath.Dir(remote), string(os.PathSeparator))
+	// Split the path into parts and ensure each directory exists
+	parts := strings.Split(path.Dir(remote), "/")
 	currentPath := ""
+	tx, err := f.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
 
 	for _, part := range parts {
 		if part == "" {
 			continue
 		}
-		currentPath = filepath.Join(currentPath, part)
+		currentPath = path.Join(currentPath, part)
 		query := `INSERT OR IGNORE INTO files (remote, size, mod_time, has_hash, hash, deleted, is_dir) VALUES (?, 0, ?, 0, '', 0, 1)`
-		_, err := f.db.Exec(query, currentPath, time.Now().Format(time.RFC3339))
+		_, err := tx.Exec(query, currentPath, time.Now().Format(time.RFC3339))
 		if err != nil {
 			return fmt.Errorf("failed to insert directory %s: %w", currentPath, err)
 		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil
@@ -152,8 +172,8 @@ func (f *Fs) ensureDirectoryStructure(remote string) error {
 // List the objects and directories in dir into entries
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	fs.Infof(nil, "VirtualFS: Listing contents of directory: %s", dir)
-	f.dbLock.Lock()
-	defer f.dbLock.Unlock()
+	f.dbLock.RLock()
+	defer f.dbLock.RUnlock()
 
 	var query string
 	var args []interface{}
@@ -161,7 +181,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		query = `SELECT remote, size, mod_time, has_hash, hash, deleted, is_dir FROM files WHERE remote NOT LIKE '%/%' AND deleted = 0`
 	} else {
 		query = `SELECT remote, size, mod_time, has_hash, hash, deleted, is_dir FROM files WHERE remote LIKE ? AND deleted = 0`
-		args = append(args, filepath.Join(dir, "%"))
+		args = append(args, dir+"/%")
 	}
 
 	rows, err := f.db.Query(query, args...)
@@ -179,7 +199,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 		o.fs = f
 		o.modTime, _ = time.Parse(time.RFC3339, modTime)
-		if dir == "" || filepath.Dir(o.remote) == dir {
+		if dir == "" || path.Dir(o.remote) == dir {
 			if o.isDir {
 				entries = append(entries, fs.NewDir(o.remote, o.modTime))
 			} else {
@@ -194,15 +214,15 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 // NewObject finds the Object at remote
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	f.dbLock.Lock()
-	defer f.dbLock.Unlock()
+	f.dbLock.RLock()
+	defer f.dbLock.RUnlock()
 
 	query := `SELECT size, mod_time, has_hash, hash, deleted, is_dir FROM files WHERE remote = ?`
 	var o Object
 	var modTime string
 	err := f.db.QueryRow(query, remote).Scan(&o.size, &modTime, &o.hasHash, &o.hash, &o.deleted, &o.isDir)
 	if err == sql.ErrNoRows || o.deleted || o.isDir {
-		fs.Debugf(nil, "VirtualFS: Object not found for remote %s", remote)
+		fs.Infof(nil, "VirtualFS: Object not found for remote %s", remote)
 		return nil, fs.ErrorObjectNotFound
 	}
 	if err != nil {
@@ -212,7 +232,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	o.fs = f
 	o.remote = remote
 	o.modTime, _ = time.Parse(time.RFC3339, modTime)
-	fs.Debugf(nil, "VirtualFS: Object found for remote %s", remote)
+	fs.Infof(nil, "VirtualFS: Object found for remote %s", remote)
 	return &o, nil
 }
 
@@ -230,7 +250,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 
 	// Create parent directories in filesystem
-	err = os.MkdirAll(filepath.Dir(filePath), 0755)
+	err = os.MkdirAll(path.Dir(filePath), 0755)
 	if err != nil {
 		return nil, err
 	}
@@ -241,30 +261,29 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 	defer outFile.Close()
 
-	// Copy the content directly
-	size, err := io.Copy(outFile, in)
+	// Compute hash while copying
+	multiHasher, err := hash.NewMultiHasherTypes(hash.NewHashSet(hash.MD5))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create multi hasher: %w", err)
+	}
+	teeReader := io.TeeReader(in, multiHasher)
+
+	// Copy the content and compute hash
+	size, err := io.Copy(outFile, teeReader)
 	if err != nil {
 		return nil, err
 	}
 
-	hashSum := ""
-	fs.Debugf(nil, "VirtualFS: Getting hash for remote %s", remote)
-	srcHash, err := src.Hash(ctx, hash.MD5)
-	if err == nil && srcHash != "" {
-		hashSum = srcHash
-		fs.Debugf(nil, "VirtualFS: Got hash %s for remote %s", hashSum, remote)
-	} else if err != nil {
-		fs.Debugf(nil, "VirtualFS: Error getting hash for remote %s: %v", remote, err)
-	} else {
-		fs.Debugf(nil, "VirtualFS: No hash available for remote %s", remote)
-	}
+	// Get the computed hash
+	hashSum := multiHasher.Sums()[hash.MD5]
+	hasHash := hashSum != ""
 
 	// Create or update metadata in database
 	f.dbLock.Lock()
 	defer f.dbLock.Unlock()
 
 	query := `INSERT OR REPLACE INTO files (remote, size, mod_time, has_hash, hash, deleted, is_dir) VALUES (?, ?, ?, ?, ?, ?, ?)`
-	_, err = f.db.Exec(query, remote, size, src.ModTime(ctx).Format(time.RFC3339), hashSum != "", hashSum, false, false)
+	_, err = f.db.Exec(query, remote, size, src.ModTime(ctx).Format(time.RFC3339), hasHash, hashSum, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +294,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		remote:  remote,
 		size:    size,
 		modTime: src.ModTime(ctx),
-		hasHash: hashSum != "",
+		hasHash: hasHash,
 		hash:    hashSum,
 		deleted: false,
 		isDir:   false,
@@ -312,7 +331,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	// Check if the directory is empty in the database
 	query := `SELECT COUNT(*) FROM files WHERE remote LIKE ? AND remote != ? AND deleted = 0`
 	var count int
-	err = f.db.QueryRow(query, filepath.Join(dir, "%"), dir).Scan(&count)
+	err = f.db.QueryRow(query, dir+"/%", dir).Scan(&count)
 	if err != nil {
 		return err
 	}
@@ -359,7 +378,7 @@ func (f *Fs) Features() *fs.Features {
 
 // fullPath returns the full path for a given remote path
 func (f *Fs) fullPath(remote string) string {
-	return filepath.Join(f.opt.RootDirectory, remote)
+	return path.Join(f.opt.RootDirectory, remote)
 }
 
 // ===== Object Methods =====
@@ -384,7 +403,7 @@ func (o *Object) String() string {
 
 // ModTime returns the modification time of the object
 func (o *Object) ModTime(ctx context.Context) time.Time {
-	fs.Debugf(nil, "VirtualFS: Getting mod time %v for remote %s", o.modTime, o.remote)
+	fs.Infof(nil, "VirtualFS: Getting mod time %v for remote %s", o.modTime, o.remote)
 	return o.modTime
 }
 
@@ -394,7 +413,7 @@ func (o *Object) Size() int64 {
 	if o.deleted {
 		size = 0
 	}
-	fs.Debugf(nil, "VirtualFS: Getting size %d for remote %s", size, o.remote)
+	fs.Infof(nil, "VirtualFS: Getting size %d for remote %s", size, o.remote)
 	return size
 }
 
@@ -404,10 +423,10 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 		return "", hash.ErrUnsupported
 	}
 	if o.hasHash {
-		fs.Debugf(nil, "VirtualFS: Getting hash %v for remote %s", o.hash, o.remote)
+		fs.Infof(nil, "VirtualFS: Getting hash %v for remote %s", o.hash, o.remote)
 		return o.hash, nil
 	}
-	fs.Debugf(nil, "VirtualFS: No hash available for remote %s", o.remote)
+	fs.Infof(nil, "VirtualFS: No hash available for remote %s", o.remote)
 	return "", nil
 }
 
@@ -416,7 +435,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return os.Open(o.fs.fullPath(o.remote))
 }
 
-// Remove removes the object, if the file was already deleted, then it creates a new file with the same name but with the .delete suffix
+// Remove removes the object
 func (o *Object) Remove(ctx context.Context) error {
 	fs.Infof(nil, "VirtualFS: Remove called for remote %s", o.remote)
 
@@ -426,17 +445,13 @@ func (o *Object) Remove(ctx context.Context) error {
 		return err
 	}
 
-	// Create empty .delete placeholder file
+	// Create a .delete placeholder file to indicate deletion
 	deletePath := o.fs.fullPath(o.remote + ".delete")
-	err = os.MkdirAll(filepath.Dir(deletePath), 0755)
+	deleteFile, err := os.Create(deletePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create delete placeholder: %w", err)
 	}
-	f, err := os.Create(deletePath)
-	if err != nil {
-		return err
-	}
-	f.Close()
+	deleteFile.Close()
 
 	// Update metadata in database
 	o.fs.dbLock.Lock()
@@ -444,7 +459,13 @@ func (o *Object) Remove(ctx context.Context) error {
 
 	query := `UPDATE files SET deleted = 1, mod_time = ? WHERE remote = ?`
 	_, err = o.fs.db.Exec(query, time.Now().Format(time.RFC3339), o.remote)
-	return err
+	if err != nil {
+		return err
+	}
+
+	o.deleted = true
+
+	return nil
 }
 
 // SetModTime sets the modification time of the object
@@ -467,7 +488,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	fs.Infof(nil, "VirtualFS: Update called for remote %s", o.remote)
 	// Save new content
 	filePath := o.fs.fullPath(o.remote)
-	err := os.MkdirAll(filepath.Dir(filePath), 0755)
+	err := os.MkdirAll(path.Dir(filePath), 0755)
 	if err != nil {
 		return err
 	}
@@ -478,33 +499,36 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	defer outFile.Close()
 
-	// Use TeeReader to compute hash while copying
-	hasher := hash.NewMultiHasher()
-	teeReader := io.TeeReader(in, hasher)
+	// Compute hash while copying
+	multiHasher, err := hash.NewMultiHasherTypes(hash.NewHashSet(hash.MD5))
+	if err != nil {
+		return fmt.Errorf("failed to create multi hasher: %w", err)
+	}
+	teeReader := io.TeeReader(in, multiHasher)
 
+	// Copy the content and compute hash
 	size, err := io.Copy(outFile, teeReader)
 	if err != nil {
 		return err
 	}
 
+	// Get the computed hash
+	hashSum := multiHasher.Sums()[hash.MD5]
+	hasHash := hashSum != ""
+
 	// Update metadata in database
 	o.fs.dbLock.Lock()
 	defer o.fs.dbLock.Unlock()
 
-	hashSum, err := src.Hash(ctx, hash.MD5)
-	if err != nil {
-		hashSum = ""
-	}
-
 	query := `UPDATE files SET size = ?, mod_time = ?, has_hash = ?, hash = ?, deleted = 0, is_dir = 0 WHERE remote = ?`
-	_, err = o.fs.db.Exec(query, size, src.ModTime(ctx).Format(time.RFC3339), hashSum != "", hashSum, o.remote)
+	_, err = o.fs.db.Exec(query, size, src.ModTime(ctx).Format(time.RFC3339), hasHash, hashSum, o.remote)
 	if err != nil {
 		return err
 	}
 
 	o.size = size
 	o.modTime = src.ModTime(ctx)
-	o.hasHash = hashSum != ""
+	o.hasHash = hasHash
 	o.hash = hashSum
 	o.deleted = false
 	o.isDir = false
