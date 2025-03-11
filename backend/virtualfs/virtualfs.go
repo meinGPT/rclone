@@ -239,12 +239,42 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 // Put the object
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	remote := src.Remote()
+	fs.Infof(nil, "VirtualFS: Put called for remote %s", remote)
+
+	existingObj, err := f.NewObject(ctx, remote)
+	if err != nil && err != fs.ErrorObjectNotFound {
+		return nil, err
+	}
+
+	shouldUpdate := true
+	if err == nil {
+		shouldUpdate = false
+		if src.Size() != existingObj.Size() {
+			shouldUpdate = true
+		} else if !src.ModTime(ctx).Equal(existingObj.ModTime(ctx)) {
+			shouldUpdate = true
+		} else {
+			srcSupportsMD5 := src.Fs().Hashes().Contains(hash.MD5) && f.Hashes().Contains(hash.MD5)
+			if srcSupportsMD5 {
+				hashSrc, _ := src.Hash(ctx, hash.MD5)
+				if hashSrc != existingObj.(*Object).hash {
+					shouldUpdate = true
+				}
+			}
+		}
+
+		if !shouldUpdate {
+			fs.Infof(f, "Skipping identical file: %s", remote)
+			return existingObj, nil
+		}
+	}
+
 	filePath := f.fullPath(remote)
 
 	fs.Infof(nil, "VirtualFS: Put called for remote %s", remote)
 
 	// Ensure directory structure exists in the database
-	err := f.ensureDirectoryStructure(remote)
+	err = f.ensureDirectoryStructure(remote)
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure directory structure: %w", err)
 	}
@@ -486,7 +516,23 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 // Update updates the object with new content
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	fs.Infof(nil, "VirtualFS: Update called for remote %s", o.remote)
-	// Save new content
+
+	shouldUpdate := true
+	if o.size == src.Size() {
+		srcSupportsMD5 := src.Fs().Hashes().Contains(hash.MD5) && o.fs.Hashes().Contains(hash.MD5)
+		hashh, _ := src.Hash(ctx, hash.MD5)
+		if !srcSupportsMD5 || hashh == o.hash {
+			if !src.ModTime(ctx).Equal(o.ModTime(ctx)) {
+				shouldUpdate = false
+			}
+		}
+	}
+
+	if !shouldUpdate {
+		fs.Infof(o.fs, "Skipping identical file: %s", o.remote)
+		return nil
+	}
+
 	filePath := o.fs.fullPath(o.remote)
 	err := os.MkdirAll(path.Dir(filePath), 0755)
 	if err != nil {
